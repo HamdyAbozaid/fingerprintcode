@@ -1,220 +1,186 @@
-// src/main.cpp
-
 #include <Arduino.h>
-#include <WiFi.h>
-#include <SPIFFS.h>
-#include <Bounce2.h>
-#include <LiquidCrystal.h>
-#include <Adafruit_Fingerprint.h>
+#include "config.h"    // Project-specific configurations
+#include "globals.h"   // Global variables and objects (declarations)
+
+// Include Module Headers
+#include "DisplayModule.h"
+#include "FingerprintModule.h"
+#include "StorageModule.h"
+#include "TimeModule.h"
+#include "WiFiModule.h"
+#include "BackendModule.h"
+#include "OTAModule.h"
+#include "PowerModule.h"
+#include "SystemModule.h"
+
+// Include necessary libraries (some might be covered by globals.h or module headers)
+#include <WiFi.h> // For WiFi.status in loop
 #include <esp_sleep.h>
-#include <driver/rtc_io.h>
+#include <driver/rtc_io.h> // For gpio_num_t
 #include <ArduinoOTA.h> // For ArduinoOTA.handle()
 
-// Include global configuration header
-#include "config.h"
-
-// Include custom modules
-#include "Utils.h"
-#include "PowerManagement.h"
-#include "OTAManager.h"
-#include "LCDManager.h"
-#include "OfflineLogger.h"
-
-// Global Instances (declared extern in headers)
-// Initialize with values from config.h
-LiquidCrystal lcd(LCD_RS, LCD_EN, LCD_D4, LCD_D5, LCD_D6, LCD_D7);
-HardwareSerial mySerial(2); // Use UART2
+// --- Global Object Definitions (as declared 'extern' in globals.h) ---
+LiquidCrystal lcd(RS_PIN, EN_PIN, D4_PIN, D5_PIN, D6_PIN, D7_PIN);
+HardwareSerial mySerial(2); // UART2 for fingerprint sensor (RX:16, TX:17 default)
 Adafruit_Fingerprint finger = Adafruit_Fingerprint(&mySerial);
+
+SPIClass hspi(HSPI); // HSPI bus
+Adafruit_FlashTransport_SPI flashTransport(FLASH_CS_PIN, &hspi);
+Adafruit_SPIFlash flash(&flashTransport);
+Adafruit_LittleFS filesys(&flash);
+
 Bounce debouncer = Bounce();
 
-// Global Variables (these are state variables, not configuration)
+// --- Global Variable Definitions (as declared 'extern' in globals.h) ---
 RTC_DATA_ATTR int bootCount = 0;
 bool isOffline = false;
 unsigned long lastActivity = 0;
 unsigned long lastSyncAttempt = 0;
 
-// Forward declarations for functions defined in main.cpp if they call each other
-void initSystem();
-void verifyFingerprint();
+OTAState otaState = OTA_IDLE;
+unsigned long otaStartTime = 0;
+String pendingFirmwareURL = "";
+String expectedHash = "";
+
 
 void setup() {
-    Serial.begin(115200);
+  Serial.begin(115200);
+  unsigned long serialStartTime = millis();
+  while (!Serial && (millis() - serialStartTime < 2000)) { // Wait for serial for debugging
+    delay(10);
+  }
 
-    // Initialize hardware pins using definitions from config.h
-    pinMode(SENSOR_PWR_PIN, OUTPUT);
-    digitalWrite(SENSOR_PWR_PIN, HIGH); // Ensure sensor is powered
-    pinMode(LCD_BACKLIGHT_PIN, OUTPUT);
-    digitalWrite(LCD_BACKLIGHT_PIN, HIGH); // Turn on LCD backlight initially
-    pinMode(BATTERY_PIN, INPUT); // Configure battery monitoring pin
+  // Initialize hardware pins
+  pinMode(SENSOR_PWR_PIN, OUTPUT);
+  digitalWrite(SENSOR_PWR_PIN, HIGH);
+  pinMode(LCD_BACKLIGHT_PIN, OUTPUT);
+  digitalWrite(LCD_BACKLIGHT_PIN, HIGH);
+  pinMode(BATTERY_PIN, INPUT);
 
-    // Initialize LCD (uses pins from config.h)
-    LCDManager::begin(16, 2);
-    LCDManager::print("System Booting");
+  // Initialize LCD
+  lcd.begin(16, 2);
+  lcd.print("System Booting");
+  recordLCDActivity(); // From DisplayModule
 
-    // Button setup with debouncing
-    pinMode(BUTTON_PIN, INPUT_PULLUP); // Button connected to GND, so use PULLUP
-    debouncer.attach(BUTTON_PIN);
-    debouncer.interval(25); // Debounce delay
+  // Initialize Button
+  pinMode(BUTTON_PIN, INPUT_PULLUP);
+  debouncer.attach(BUTTON_PIN);
+  debouncer.interval(25);
 
-    // Check for recovery mode (button held down during boot)
-    if (digitalRead(BUTTON_PIN) == LOW) {
-        OTAManager::enterRecoveryMode(); // This is a blocking function
+  // Check for recovery mode
+  delay(50); // Small delay for button signal to stabilize after power-on
+  if (digitalRead(BUTTON_PIN) == LOW) {
+    enterRecoveryMode(); // From SystemModule
+  }
+
+  // Initialize HSPI for External Flash
+  // SCK, MISO, MOSI. CS is handled by flashTransport.
+  hspi.begin(FLASH_SCK_PIN, FLASH_MISO_PIN, FLASH_MOSI_PIN); 
+
+  // Initialize External Flash Chip
+  Serial.println("Initializing External Flash Chip...");
+  if (!flash.begin()) {
+    Serial.println("Error, failed to initialize External Flash chip!");
+    lcd.clear(); lcd.print("Ext.Flash Err"); delay(2000); while(1) yield(); // Halt
+  }
+  Serial.print("Flash chip JEDEC ID: 0x"); Serial.println(flash.getJEDECID(), HEX);
+  uint32_t flashSize = flash.size();
+  Serial.print("Flash size: "); Serial.print(flashSize / (1024 * 1024)); Serial.println(" MB");
+
+  // Initialize LittleFS on External Flash
+  Serial.println("Initializing LittleFS on External Flash...");
+  if (!filesys.begin()) {
+    Serial.println("Failed to mount LittleFS. Formatting...");
+    lcd.clear(); lcd.print("Formatting ExtFS"); recordLCDActivity(); delay(1000);
+    if (!filesys.format()) {
+      Serial.println("Error, failed to format LittleFS on external flash!");
+      lcd.clear(); lcd.print("Ext.Format Err"); delay(2000); while(1) yield(); // Halt
     }
-
-    // Initialize SPIFFS (flash file system)
-    if (!SPIFFS.begin(true)) {
-        Serial.println("SPIFFS mount failed! Please reboot or check flash.");
-        LCDManager::clear();
-        LCDManager::print("Storage Error!");
-        delay(2000);
-        while(1);
+    // Try mounting again after formatting
+    if (!filesys.begin()) {
+        Serial.println("Failed to mount LittleFS even after formatting!");
+        lcd.clear(); lcd.print("Ext.Mount Err"); delay(2000); while(1) yield(); // Halt
     }
-    Serial.println("SPIFFS mounted successfully.");
+    Serial.println("LittleFS formatted and mounted successfully.");
+  } else {
+    Serial.println("LittleFS on External Flash mounted successfully.");
+  }
 
-    // Initialize fingerprint sensor
-    mySerial.begin(FINGER_BAUD_RATE, SERIAL_8N1, FINGER_RX_PIN, FINGER_TX_PIN);
-    if (!finger.begin(FINGER_BAUD_RATE)) {
-        Serial.println("Did not find fingerprint sensor :(");
-        LCDManager::clear();
-        LCDManager::print("Sensor Error!");
-        while(1);
-    }
-    Serial.println("Found fingerprint sensor!");
-    finger.setSecurityLevel(FINGERPRINT_SECURITY_LOW); // Adjust as needed
+  // Initialize Fingerprint Sensor
+  mySerial.begin(57600, SERIAL_8N1, 16, 17); // Fingerprint sensor UART
+  if (!finger.begin(57600)) {
+    Serial.println("Did not find fingerprint sensor :(");
+    lcd.clear(); lcd.print("Sensor Error!"); while(1) yield(); // Halt
+  }
+  Serial.println("Found fingerprint sensor!");
+  finger.setSecurityLevel(FINGERPRINT_SECURITY_LOW); // Adjust as needed
 
-    // Configure wake sources for deep sleep
-    esp_sleep_enable_ext0_wakeup(GPIO_NUM_0, LOW); // Assumes BUTTON_PIN is GPIO_NUM_0
+  // Configure deep sleep wake source
+  esp_sleep_enable_ext0_wakeup((gpio_num_t)BUTTON_PIN, LOW); // Wake on button press
 
-    // Determine the cause of wakeup
-    esp_sleep_wakeup_cause_t wakeup_reason = esp_sleep_get_wakeup_cause();
-    if (wakeup_reason == ESP_SLEEP_WAKEUP_UNDEFINED || wakeup_reason == ESP_SLEEP_WAKEUP_EXT0) {
-        bootCount++;
-        Serial.printf("Boot count: %d\n", bootCount);
-        initSystem();
-    } else {
-        Serial.printf("Wakeup cause: %d. Entering deep sleep.\n", wakeup_reason);
-        PowerManagement::enterDeepSleep();
-    }
+  // Determine wakeup cause and proceed
+  esp_sleep_wakeup_cause_t wakeup_reason = esp_sleep_get_wakeup_cause();
+  if (wakeup_reason == ESP_SLEEP_WAKEUP_UNDEFINED || wakeup_reason == ESP_SLEEP_WAKEUP_EXT0) {
+    bootCount++;
+    Serial.printf("Boot count: %d\n", bootCount);
+    initSystem(); // From SystemModule: Initializes WiFi, NTP, OTA
+  } else {
+    Serial.printf("Unexpected wakeup cause: %d. Entering deep sleep.\n", wakeup_reason);
+    enterDeepSleep(); // From PowerModule
+  }
 }
 
 void loop() {
-    ArduinoOTA.handle();
-    debouncer.update();
-    PowerManagement::manageLCDPower(LCD_BACKLIGHT_PIN);
+  ArduinoOTA.handle(); // Service local OTA updates (from ArduinoOTA library)
+  debouncer.update();  // Update button state
+  manageLCDPower();    // From PowerModule: Control LCD backlight
 
-    // If an OTA download is in progress, pause other operations
-    if (OTAManager::getOtaState() == OTA_DOWNLOADING) {
-        return;
-    }
+  // If an OTA process (downloading, verifying, updating) is active, yield to it
+  if (otaState == OTA_DOWNLOADING || otaState == OTA_VERIFYING || otaState == OTA_UPDATING) {
+    delay(10); // Small yield to allow OTA process to run
+    return;
+  }
 
-    // Check for button press: 3-second hold to force WiFi Manager config portal
-    if (debouncer.fell() && debouncer.currentDuration() >= 3000) {
+  // Check for button press: 3-second hold to force WiFi Manager
+  if (debouncer.read() == LOW && debouncer.currentDuration() >= 3000) {
+     if (debouncer.fell()) { // Trigger once on the transition to held state
         Serial.println("Button held for 3s. Forcing WiFiManager configuration.");
-        Utils::startWiFiManager(true);
-        PowerManagement::recordLCDActivity(LCD_BACKLIGHT_PIN);
-    } else if (debouncer.fell()) {
-        PowerManagement::recordLCDActivity(LCD_BACKLIGHT_PIN);
+        startWiFiManager(true); // From WiFiModule (will restart ESP)
+     }
+  } else if (debouncer.fell()) { // Short button press
+    Serial.println("Button pressed (short).");
+    recordLCDActivity(); // From DisplayModule: Wake up LCD
+  }
+
+  // Normal system operation (only if system was initialized)
+  if (bootCount > 0) {
+    verifyFingerprint(); // From FingerprintModule: Scan for fingerprints
+
+    // Check for backend updates periodically
+    static unsigned long lastUpdateCheck = 0;
+    // Also check immediately on first loop after init if lastUpdateCheck is 0
+    if (millis() - lastUpdateCheck > UPDATE_CHECK_INTERVAL || lastUpdateCheck == 0) {
+      if (WiFi.status() == WL_CONNECTED && otaState == OTA_IDLE) { // Only if connected and not in OTA
+          Serial.println("Checking for firmware updates from backend...");
+          checkForUpdates(); // From OTAModule
+      }
+      lastUpdateCheck = millis(); // Update check time
     }
 
-    // Normal system operation (only if system initialized after boot/wakeup)
-    if (bootCount > 0) {
-        verifyFingerprint();
-
-        // Check for backend updates periodically
-        static unsigned long lastUpdateCheck = 0;
-        if (millis() - lastUpdateCheck > UPDATE_CHECK_INTERVAL) { // Use constant from config.h
-            Serial.println("Checking for firmware updates from backend...");
-            OTAManager::checkForUpdates();
-            lastUpdateCheck = millis();
-        }
-
-        // Attempt to sync offline logs if in offline mode
-        if (isOffline && (millis() - lastSyncAttempt > 30000 || lastSyncAttempt == 0)) {
-            Serial.println("Attempting to sync offline logs.");
-            OfflineLogger::syncOfflineLogs(isOffline);
-            lastSyncAttempt = millis();
-        }
-
-        // Enter deep sleep after a period of inactivity if not in offline mode
-        if (millis() > INACTIVITY_TIMEOUT && !isOffline) { // Use constant from config.h
-            Serial.println("Inactivity timeout reached. Entering deep sleep.");
-            PowerManagement::enterDeepSleep();
-        }
+    // Attempt to sync offline logs if in offline mode
+    if (isOffline && (millis() - lastSyncAttempt > 30000 || lastSyncAttempt == 0)) {
+      if (WiFi.status() == WL_CONNECTED) { // Only if connected
+        Serial.println("Attempting to sync offline logs.");
+        syncOfflineLogs(); // From StorageModule
+      }
+      lastSyncAttempt = millis(); // Update sync attempt time
     }
 
-    delay(10);
-}
-
-// Initializes core system components after boot/wakeup
-void initSystem() {
-    Serial.println("Initializing System...");
-    LCDManager::clear();
-    LCDManager::print("Initializing...");
-    PowerManagement::recordLCDActivity(LCD_BACKLIGHT_PIN);
-
-    // Attempt to connect to saved WiFi credentials
-    if (!Utils::autoConnectWiFi()) {
-        Serial.println("AutoConnect failed. Starting WiFiManager for configuration.");
-        Utils::startWiFiManager(false);
-    } else {
-        // If WiFi connected, set up time synchronization and local OTA
-        Utils::setupNTP();
-        OTAManager::setupOTA();
+    // Enter deep sleep after inactivity if not offline and no OTA in progress
+    if (millis() - lastActivity > INACTIVITY_TIMEOUT && !isOffline && otaState == OTA_IDLE) {
+      Serial.println("Inactivity timeout reached. Entering deep sleep.");
+      enterDeepSleep(); // From PowerModule
     }
-}
-
-// Manages the fingerprint scanning and attendance logging process
-void verifyFingerprint() {
-    LCDManager::showFingerprintPrompt();
-    PowerManagement::recordLCDActivity(LCD_BACKLIGHT_PIN);
-
-    int p = finger.getImage();
-    if (p != FINGERPRINT_OK) {
-        if (p == FINGERPRINT_NOFINGER) return;
-        Serial.printf("getImage error: %d\n", p);
-        LCDManager::clear();
-        LCDManager::print("Image Error");
-        delay(1000);
-        return;
-    }
-
-    p = finger.image2Tz();
-    if (p != FINGERPRINT_OK) {
-        Serial.printf("image2Tz error: %d\n", p);
-        LCDManager::clear();
-        LCDManager::print("Convert Error");
-        delay(1000);
-        return;
-    }
-
-    p = finger.fingerFastSearch();
-    if (p == FINGERPRINT_OK) {
-        int userId = finger.fingerID;
-        Serial.printf("Found ID #%d with confidence %d\n", userId, finger.confidence);
-
-        String timestamp = Utils::getTimestamp();
-        Serial.printf("Attendance attempt for ID %d at %s\n", userId, timestamp.c_str());
-
-        if (WiFi.status() == WL_CONNECTED) {
-            if (Utils::sendToBackend(userId, timestamp)) {
-                LCDManager::showAttendanceResult(true, userId);
-                isOffline = false;
-                return;
-            } else {
-                Serial.println("Failed to send to backend, falling back to offline logging.");
-            }
-        } else {
-            Serial.println("WiFi not connected, logging offline.");
-        }
-
-        isOffline = true;
-        OfflineLogger::logAttendanceOffline(userId, timestamp.c_str());
-        LCDManager::showOfflineWarning();
-
-    } else if (p == FINGERPRINT_NOFINGER) {
-        LCDManager::showAttendanceResult(false, 0);
-    } else {
-        Serial.printf("Fingerprint search error: %d\n", p);
-        LCDManager::showAttendanceResult(false, 0);
-    }
+  }
+  delay(10); // Small delay to yield CPU to other tasks
 }
